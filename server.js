@@ -1,6 +1,6 @@
 const express=require("express"),http=require("http"),crypto=require("crypto");
 const {Server}=require("socket.io");
-const app=express(),server=http.createServer(app),io=new Server(server),PORT=process.env.PORT||3000;
+const app=express(),server=http.createServer(app),io=new Server(server,{pingInterval:25000,pingTimeout:60000}),PORT=process.env.PORT||3000;
 app.use(express.static("public"));
 const rooms=new Map(),suits=["♣","♦","♥","♠"],ranks=["A","2","3","4","5","6","7","8","9","10","J","Q","K"],values={A:1,"2":2,"3":3,"4":4,"5":5,"6":0,"7":7,"8":8,"9":9,"10":10,J:11,Q:12,K:13};
 const rank=c=>c.slice(0,-1),val=c=>values[rank(c)],total=h=>h.reduce((s,c)=>s+val(c),0);
@@ -17,13 +17,26 @@ function score(r,d){let t=r.hands.map(total),min=Math.min(...t),low=t.map((n,i)=
  r.roundOver=true;r.matchOver=r.scores.some(n=>n>=r.limit);if(r.matchOver)r.result.text+=r.scores[0]===r.scores[1]?" Match tied.":` Player ${r.scores[0]<r.scores[1]?1:2} wins the match.`;r.message=r.result.text}
 io.on("connection",s=>{
  const fail=m=>s.emit("notice",m),get=()=>rooms.get(s.data.roomCode);
- s.on("createRoom",({name,limit})=>{let c;do{c=code()}while(rooms.has(c));let r={code:c,players:[{name:String(name||"Player 1").slice(0,24),socketId:s.id},null],scores:[0,0],round:1,limit:[100,200,500].includes(+limit)?+limit:100};deal(r,Math.random()<.5?0:1);rooms.set(c,r);s.data.roomCode=c;s.data.seat=0;s.emit("joined",{code:c,seat:0});broadcast(r)});
- s.on("joinRoom",({name,code:c})=>{c=String(c||"").trim().toUpperCase();let r=rooms.get(c);if(!r)return fail("Room not found. Check the code.");if(r.players[1])return fail("This room already has two players.");r.players[1]={name:String(name||"Player 2").slice(0,24),socketId:s.id};s.data.roomCode=c;s.data.seat=1;s.emit("joined",{code:c,seat:1});r.message=`${r.players[1].name} joined. Game ready.`;broadcast(r)});
- s.on("discard",cards=>{let r=get(),p=s.data.seat;if(!r||p!==r.turn||r.phase!=="discard"||r.roundOver||r.matchOver)return fail("It isn't your discard phase.");if(!Array.isArray(cards)||cards.length<1||cards.length>4)return fail("Discard 1–4 cards.");let h=r.hands[p];if(new Set(cards).size!==cards.length||cards.some(c=>!h.includes(c)))return fail("Those cards aren't all in your hand.");let rs=cards.map(rank);if(rs.length>1&&new Set(rs).size!==1)return fail("Multiple discards must be the same rank.");let previous=r.lastThrowRank,matching=previous!==null&&rs[0]===previous;r.hands[p]=h.filter(c=>!cards.includes(c));r.discard.push(...cards);r.lastThrowRank=rs[0];r.lastThrowCount=cards.length;
+ s.on("reconnectRoom",({code:c,token,name})=>{
+  c=String(c||"").trim().toUpperCase();
+  const r=rooms.get(c);
+  if(!r)return fail("This room is no longer available. The server may have restarted; create a new room.");
+  const seat=r.players.findIndex(p=>p&&p.token===token);
+  if(seat<0)return fail("Could not restore your seat. Please create or join a room again.");
+  r.players[seat].socketId=s.id;
+  if(name)r.players[seat].name=String(name).slice(0,24);
+  s.data.roomCode=c;s.data.seat=seat;
+  s.emit("joined",{code:c,seat,token});
+  r.message=`Player ${seat+1} reconnected.`;
+  broadcast(r);
+ });
+ s.on("createRoom",({name,limit})=>{let c;do{c=code()}while(rooms.has(c));let token=crypto.randomBytes(24).toString("hex");let r={code:c,players:[{name:String(name||"Player 1").slice(0,24),socketId:s.id,token},null],scores:[0,0],round:1,limit:[100,200,500].includes(+limit)?+limit:100};deal(r,Math.random()<.5?0:1);rooms.set(c,r);s.data.roomCode=c;s.data.seat=0;s.emit("joined",{code:c,seat:0,token});broadcast(r)});
+ s.on("joinRoom",({name,code:c})=>{c=String(c||"").trim().toUpperCase();let r=rooms.get(c);if(!r)return fail("Room not found. Check the code.");if(r.players[1])return fail("This room already has two players.");let token=crypto.randomBytes(24).toString("hex");r.players[1]={name:String(name||"Player 2").slice(0,24),socketId:s.id,token};s.data.roomCode=c;s.data.seat=1;s.emit("joined",{code:c,seat:1,token});r.message=`${r.players[1].name} joined. Game ready.`;broadcast(r)});
+ s.on("discard",cards=>{let r=get(),p=s.data.seat;if(!r||p!==r.turn||r.phase!=="discard"||r.roundOver||r.matchOver)return fail("It isn't your discard phase.");if(!Array.isArray(cards)||cards.length<1||cards.length>4)return fail("Discard 1–4 cards.");let h=r.hands[p];if(new Set(cards).size!==cards.length||cards.some(c=>!h.includes(c)))return fail("Those cards aren't all in your hand.");let rs=cards.map(rank);if(rs.length>1&&new Set(rs).size!==1)return fail("Multiple discards must be the same rank.");let previous=r.lastThrowRank!==null?r.lastThrowRank:(r.openingAvailable&&r.opening?r.opening.slice(0,-1):null),matching=previous!==null&&rs[0]===previous;r.hands[p]=h.filter(c=>!cards.includes(c));r.discard.push(...cards);r.lastThrowRank=rs[0];r.lastThrowCount=cards.length;
  if(matching){endTurn(r,`Player ${p+1} matched ${rs[0]} and skips pickup.`)}else{r.phase="pickup";r.message=`Player ${p+1} discarded ${cards.join(", ")}. Pick up one card.`}broadcast(r)});
- s.on("pickup",source=>{let r=get(),p=s.data.seat;if(!r||p!==r.turn||r.phase!=="pickup"||r.roundOver||r.matchOver)return fail("It isn't your pickup phase.");let c;if(source==="deck"){if(!recycle(r))return fail("No cards left to draw.");c=r.deck.pop()}else if(source==="discard"){if(!r.discard.length)return fail("Discard pile is empty.");c=r.discard.pop()}else if(source==="opening"){if(!r.openingAvailable||!r.opening)return fail("Opening card isn't available.");c=r.opening;r.opening=null;r.openingAvailable=false}else return fail("Invalid pickup.");r.hands[p].push(c);endTurn(r,`Player ${p+1} picked up ${c}. Turn complete.`);broadcast(r)});
+ s.on("pickup",source=>{let r=get(),p=s.data.seat;if(!r||p!==r.turn||r.phase!=="pickup"||r.roundOver||r.matchOver)return fail("It isn't your pickup phase.");let c;if(source==="deck"){if(!recycle(r))return fail("No cards left to draw.");c=r.deck.pop()}else if(source==="discard"){if(!r.discard.length)return fail("Discard pile is empty.");c=r.discard.pop()}else if(source==="opening"){if(!r.openingAvailable||!r.opening)return fail("Opening card isn't available.");c=r.opening;r.opening=null;r.openingAvailable=false}else return fail("Invalid pickup.");r.hands[p].push(c);endTurn(r,`Player ${p+1} picked up a card. Turn complete.`);broadcast(r)});
  s.on("declare",()=>{let r=get(),p=s.data.seat;if(!r||p!==r.turn||r.roundOver||r.matchOver)return fail("You can declare only on your turn.");if(r.turns.some(n=>n===0))return fail("Both players must complete one turn before declaring.");score(r,p);broadcast(r)});
  s.on("nextRound",()=>{let r=get();if(!r||s.data.seat!==0||!r.roundOver||r.matchOver)return fail("Only the host can start the next round.");r.round++;deal(r,Math.random()<.5?0:1);broadcast(r)});
- s.on("disconnect",()=>{let r=get();if(!r)return;let p=s.data.seat;if(r.players[p]&&r.players[p].socketId===s.id){r.players[p].socketId=null;r.message=`Player ${p+1} disconnected.`;broadcast(r)}if(r.players.every(x=>!x||!x.socketId))rooms.delete(r.code)});
+ s.on("disconnect",()=>{let r=get();if(!r)return;let p=s.data.seat;if(r.players[p]&&r.players[p].socketId===s.id){r.players[p].socketId=null;r.message=`Player ${p+1} disconnected. Reconnecting is possible.`;broadcast(r)}});
 });
 server.listen(PORT,()=>console.log("Declare Online on port "+PORT));
